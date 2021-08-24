@@ -13,7 +13,8 @@ class TestData
 {
 	public string $title;
 	public string $url;
-	public int|null $int = 999;
+	#[ServalUInt16]
+	public int $int = 999;
 
 	#[ServalItemType(Anchor::class)]
 	public array $anchors;
@@ -27,18 +28,34 @@ class TestData
 	public Nulls $nulls;
 }
 
+function string2bits($string)
+{
+    $bits = '';
+    for($i = 0 ; $i < strlen($string); ++$i){
+        $byte = decbin(ord($string[$i]));
+        $bits .= substr('00000000', 0, 8 - strlen($byte)) . $byte . ' ';
+    }
+    return $bits;
+}
+
 class Nulls
 {
-	public ?int $null1 = null;
-	public ?int $null2 = 1;
+	public ?bool $null1 = true;
+	#[ServalUInt8]
+	public ?int $null2 = 0;
+	#[ServalUInt16]
 	public ?int $null3 = 1;
-	public ?int $null4 = null;
+	#[ServalUInt16]
+	public ?int $null4 = 0;
+	#[ServalUInt8]
 	public ?int $null5 = 1;
-	public ?int $null6 = null;
-	public ?int $null7 = 1;
-	public ?int $null8 = null;
-	public ?int $null9 = 1;
-	public ?int $null10 = null;
+	#[ServalUInt16]
+	public ?int $null6 = 0;
+	#[ServalItemType(bool::class)]
+	public array $bools = [true, true, false, false];
+	#[ServalUInt8]
+	#[ServalItemType(int::class)]
+	public array $ints = [1, 2, 3, 4];
 }
 
 class Anchor
@@ -53,10 +70,21 @@ test_performance();
 function test_validity()
 {
 	global $testdata;
-	$testdata2 = unserval(serval($testdata), TestData::class);
+	$serval = serval($testdata, get_class($testdata));
+	#print(string2bits($serval) . "\n");
+	$testdata2 = unserval($serval, get_class($testdata));
 	print("Validity test: ");
-	print(print_r($testdata, true) === print_r($testdata2, true) ? 'ok' : 'failed');
-	print("\n");
+	$print_testdata = print_r($testdata, true);
+	$print_testdata2 = print_r($testdata2, true);
+	if ($print_testdata === $print_testdata2) {
+		print("ok\n");
+	}
+	else {
+		print("failed\n");
+		print($print_testdata);
+		print($print_testdata2);
+		exit;
+	}
 }
 
 function test_compression()
@@ -78,7 +106,7 @@ function test_performance()
 	$ser = serval($testdata);
 #	$ser = gzdeflate(serialize($testdata));
 	for ($i = 0; $i < 100000; ++$i) {
-		unserval($ser, TestData::class);
+		unserval($ser, get_class($testdata));
 #		unserialize(gzinflate($ser));
 	}
 	print('Performance: ' . round($i / (microtime(true) - $time)) . ' calls per second, '

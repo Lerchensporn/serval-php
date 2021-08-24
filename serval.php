@@ -20,13 +20,16 @@
 # same specified type.
 
 # Details:
-# - NULL termination of strings and lists is not used, instead the length of strings and arrays is stored.
-#   The reason is that PHP strings may contain NULL bytes and array items may start with NULL bytes.
-# - A bit mask is used to store the NULL value state of class variables.
+# - Null termination of strings and lists is not used, instead the length of strings and arrays is stored.
+#   The reason is that PHP strings may contain null bytes and array items may start with null bytes.
+# - A common bit mask is used to store null, bool and the used union type.
 # - To optimize performance, I minimized the number of function calls in the loops and use some copy-pasted line.
 
+# TODO:
+# - Support associative arrays.
+
 # Outlook:
-# - Ideas for better compression: Merge bool values with NULL mask, merge bool+NULL masks of all items of an array.
+# - Ideas for better compression: Merge bool+null masks of all items of an array.
 # - One may implement this also in Python and Javascript.
 # - An extension of this approach would be a language-independent description of the data model.
 #   This would allow more straight-forward interoperability across different languages.
@@ -83,32 +86,63 @@ function serval(object $object) : string
 	$className = get_class($object);
 	$properties = (new ReflectionClass($className))->getProperties(ReflectionProperty::IS_PUBLIC);
 
-	$nullableIndex = 0;
+	$maskIndex = 0;
 	foreach ($properties as $property) {
 		if (count($property->getAttributes('ServalIgnore')) > 0) {
 			continue;
 		}
-		if ($property->getType()->allowsNull()) {
-			if (!isset($serialized[(int) ($nullableIndex / 8)])) {
-				$serialized .= "\x00";
+		if ($property->getType()->allowsnull()) {
+			if (!isset($serialized[(int) ($maskIndex / 8)])) {
+				$serialized .= "\x0";
 			}
-			if ($object->{$property->getName()} === NULL) {
-				$serialized[(int) ($nullableIndex / 8)] = chr(ord($serialized[(int) ($nullableIndex / 8)]) | 1 << ($nullableIndex % 8));
+			if ($object->{$property->getName()} === null) {
+				$serialized[(int) ($maskIndex / 8)] = chr(ord($serialized[(int) ($maskIndex / 8)]) | 128 >> ($maskIndex % 8));
 			}
-			$nullableIndex += 1;
+			$maskIndex += 1;
+		}
+		if ($property->getType() instanceof ReflectionUnionType) {
+			$types = $property->getType()->getTypes();
+			$type = gettype($object->{$property->getName()});
+			$type = match($type) {
+				'integer' => 'int',
+				'boolean' => 'bool',
+				'object' => get_class($object->{$property->getName()}),
+				default => $type
+			};
+			$typeIndex = array_search($type, array_map(function($type) { return $type->getName(); }, $types));
+			$numBits = (int) ceil(log(count($types), 2));
+			for ($i = $numBits - 1; $i >= 0; --$i) {
+				if (!isset($serialized[(int) ($maskIndex / 8)])) {
+					$serialized .= "\x0";
+				}
+				if ($typeIndex & (1 << $i)) {
+					$serialized[(int) ($maskIndex / 8)] = chr(ord($serialized[(int) ($maskIndex / 8)]) | 128 >> ($maskIndex % 8));
+				}
+				$maskIndex += 1;
+			}
+		}
+		if (gettype($object->{$property->getName()}) === 'boolean') {
+			if (!isset($serialized[(int) ($maskIndex / 8)])) {
+				$serialized .= "\x0";
+			}
+			if ($object->{$property->getName()} === true) {
+				$serialized[(int) ($maskIndex / 8)] = chr(ord($serialized[(int) ($maskIndex / 8)]) | 128 >> ($maskIndex % 8));
+			}
+			$maskIndex += 1;
 		}
 	}
 	foreach ($properties as $property) {
 		if (count($property->getAttributes('ServalIgnore')) > 0) {
 			continue;
 		}
-		if (!$property->getType() instanceof ReflectionNamedType) {
-			throw new Exception('Serialization requires non-union type hints.');
-		}
-		if ($object->{$property->getName()} === NULL) {
+		if ($object->{$property->getName()} === null) {
 			continue;
 		}
-		$typeName = $property->getType()->getName();
+		$typeName = gettype($object->{$property->getName()});
+		if ($typeName === 'object') {
+			$typeName = get_class($object->{$property->getName()});
+		}
+
 		if ($typeName === 'string') {
 			list($letter, $bytes) = count($property->getAttributes('ServalLongString')) > 0 ? ['l', 4] : ['s', 2];
 			$strlen = strlen($object->{$property->getName()});
@@ -124,13 +158,14 @@ function serval(object $object) : string
 			}
 			$className = $property->getAttributes('ServalItemType')[0]->getArguments()[0];
 			list($letter, $bytes) = count($property->getAttributes('ServalLongArray')) > 0 ? ['l', 4] : ['s', 2];
-			if ($strlen > 2**(8 * $bytes) - 1) {
+			if (count($object->{$property->getName()}) > 2**(8 * $bytes) - 1) {
 				throw new Exception('Array is too long for serialization.');
 			}
 			$serialized .= pack($letter, count($object->{$property->getName()}));
 			if ($className === 'int') {
+				list($letter, $bytes) = [null, null];
 				foreach ($property->getAttributes() as $attribute) {
-					list($letter, $bytes) = match ($attribute) {
+					list($letter, $bytes) = match ($attribute->getName()) {
 						'ServalInt8' => ['c', 1],
 						'ServalUInt8' => ['C', 1],
 						'ServalInt16' => ['s', 2],
@@ -139,9 +174,9 @@ function serval(object $object) : string
 						'ServalUInt32' => ['N', 4],
 						'ServalInt64' => ['q', 8],
 						'ServalUInt64' => ['J', 8],
-						default => [NULL, NULL]
+						default => [null, null]
 					};
-					if ($letter !== NULL) {
+					if ($letter !== null) {
 						break;
 					}
 				}
@@ -159,11 +194,6 @@ function serval(object $object) : string
 					$serialized .= pack($letter, $strlen) . $item;
 				}
 			}
-			else if ($className === 'bool') {
-				foreach ($object->{$property->getName()} as $item) {
-					$serialized .= pack('c', $item);
-				}
-			}
 			else if ($className === 'float') {
 				if (count($property->getAttributes('ServalSmallFloat')) > 0) {
 					foreach ($object->{$property->getName()} as $item) {
@@ -176,6 +206,21 @@ function serval(object $object) : string
 					}
 				}
 			}
+			else if ($className === 'bool') {
+				$boolbyte = 0;
+				for ($i = 0; $i < count($object->{$property->getName()}); ++$i) {
+					if ($object->{$property->getName()}[$i] === true) {
+						$boolbyte |= 128 >> ($i % 8);
+					}
+					if ($i > 0 && $i % 8 === 0) {
+						$serialized .= chr($boolbyte);
+						$boolbyte = 0;
+					}
+				}
+				if ($i % 8 !== 0) {
+					$serialized .= chr($boolbyte);
+				}
+			}
 			else {
 				foreach ($object->{$property->getName()} as $item) {
 					if (is_subclass_of($item, $className)) {
@@ -185,9 +230,10 @@ function serval(object $object) : string
 				}
 			}
 		}
-		else if ($typeName === 'int') {
+		else if ($typeName === 'integer') {
+			list($letter, $bytes) = [null, null];
 			foreach ($property->getAttributes() as $attribute) {
-				list($letter, $bytes) = match ($attribute) {
+				list($letter, $bytes) = match ($attribute->getName()) {
 					'ServalInt8' => ['c', 1],
 					'ServalUInt8' => ['C', 1],
 					'ServalInt16' => ['s', 2],
@@ -196,16 +242,16 @@ function serval(object $object) : string
 					'ServalUInt32' => ['N', 4],
 					'ServalInt64' => ['q', 8],
 					'ServalUInt64' => ['J', 8],
-					default => [NULL, NULL]
+					default => [null, null]
 				};
-				if ($letter !== NULL) {
+				if ($letter !== null) {
 					break;
 				}
 			}
 			$serialized .= pack($letter ?? 'q', $object->{$property->getName()});
 		}
-		else if ($typeName === 'bool') {
-			$serialized .= pack('c', $object->{$property->getName()});
+		else if ($typeName === 'boolean') {
+			continue;
 		}
 		else if ($typeName === 'float') {
 			if (count($property->getAttributes('ServalSmallFloat')) > 0) {
@@ -215,7 +261,7 @@ function serval(object $object) : string
 				$serialized .= pack('E', $object->{$property->getName()});
 			}
 		}
-		else if ($property->getType() === NULL) {
+		else if ($property->getType() === null) {
 			throw new Exception('A type hint is required for serialization.');
 		}
 		else {
@@ -231,34 +277,65 @@ function unserval(string $data, string $className, int &$offset=0) : object
 	$unserialized = $class->newInstanceWithoutConstructor();
 	$properties = $class->getProperties(ReflectionProperty::IS_PUBLIC);
 
-	$numNullables = 0;
+	$unionTypes = [];
+	$nulls = [];
+	$maskIndex = 0;
+	$properties = array_filter($properties, function($property) {
+		return count($property->getAttributes('ServalIgnore')) === 0;
+	});
 	foreach ($properties as $property) {
-		if ($property->getType()->allowsNull()) {
-			$numNullables += 1;
-		}
-	}
-	$startOffset = $offset;
-	$offset += (int) ceil($numNullables / 8);
-	unset($numNullables);
-
-	$nullableIndex = 0;
-	foreach ($properties as $property) {
-		if (count($property->getAttributes('ServalIgnore')) > 0) {
-			continue;
-		}
 		$type = $property->getType();
-		if (!$type instanceof ReflectionNamedType) {
-			throw new Exception('Deserialization requires non-union type hints.');
-		}
-		if ($type->allowsNull()) {
-			$nullBit = ord($data[$startOffset + (int) ($nullableIndex / 8)]) & 1 << ($nullableIndex % 8);
-			$nullableIndex += 1;
+		if ($type->allowsnull()) {
+			$nullBit = ord($data[$offset + (int) ($maskIndex / 8)]) & 128 >> ($maskIndex % 8);
+			$maskIndex += 1;
+			$nulls[] = $nullBit;
 			if ($nullBit) {
-				$unserialized->{$property->getName()} = NULL;
+				$unserialized->{$property->getName()} = null;
 				continue;
 			}
 		}
-		$typeName = $type->getName();
+		if ($type instanceof ReflectionUnionType) {
+			$types = $property->getType()->getTypes();
+			$numBits = (int) ceil(log(count($types), 2));
+			$typeIndex = 0;
+			for ($i = $numBits - 1; $i >= 0; --$i) {
+				if (ord($data[$offset + (int) ($maskIndex / 8)]) & 128 >> ($maskIndex % 8)) {
+					$typeIndex += 2 ** $i;
+				}
+				$maskIndex += 1;
+			}
+			$type = $types[$typeIndex]->getName();
+		}
+		else {
+			$type = $type->getName();
+		}
+		if ($type === 'bool') {
+			$boolval = ord($data[$offset + (int) ($maskIndex / 8)]) & 128 >> ($maskIndex % 8);
+			$maskIndex += 1;
+			if ($boolval) {
+				$unserialized->{$property->getName()} = true;
+			}
+		}
+		$unionTypes[] = $type;
+	}
+	$startOffset = $offset;
+	$offset += (int) ceil($maskIndex / 8);
+	unset($maskIndex);
+
+	$unionIndex = 0;
+	$nullIndex = 0;
+	foreach ($properties as $property) {
+		$type = $property->getType();
+		if ($type->allowsnull() && $nulls[$nullIndex++]) {
+			continue;
+		}
+		if ($type instanceof ReflectionNamedType) {
+			$typeName = $type->getName();
+		}
+		else {
+			$typeName = $unionTypes[$unionIndex];
+			$unionIndex += 1;
+		}
 		if ($typeName === 'string') {
 			list($letter, $bytes) = count($property->getAttributes('ServalLongString')) > 0 ? ['l', 4] : ['s', 2];
 			$strlen = unpack($letter, $data, $offset)[1];
@@ -275,6 +352,7 @@ function unserval(string $data, string $className, int &$offset=0) : object
 			$count = unpack($letter, $data, $offset)[1];
 			$offset += $bytes;
 			$className = $itemType[0]->getArguments()[0];
+			$unserialized->{$property->getName()} = [];
 			if ($className === 'string') {
 				list($letter, $bytes) = count($property->getAttributes('ServalLongString')) > 0 ? ['l', 4] : ['s', 2];
 				for ($i = 0; $i < $count; ++$i) {
@@ -285,8 +363,9 @@ function unserval(string $data, string $className, int &$offset=0) : object
 				}
 			}
 			else if ($className === 'int') {
+				list($letter, $bytes) = [null, null];
 				foreach ($property->getAttributes() as $attribute) {
-					list($letter, $bytes) = match ($attribute) {
+					list($letter, $bytes) = match ($attribute->getName()) {
 						'ServalInt8' => ['c', 1],
 						'ServalUInt8' => ['C', 1],
 						'ServalInt16' => ['s', 2],
@@ -295,9 +374,9 @@ function unserval(string $data, string $className, int &$offset=0) : object
 						'ServalUInt32' => ['N', 4],
 						'ServalInt64' => ['q', 8],
 						'ServalUInt64' => ['J', 8],
-						default => [NULL, NULL]
+						default => [null, null]
 					};
-					if ($letter !== NULL) {
+					if ($letter !== null) {
 						break;
 					}
 				}
@@ -307,7 +386,15 @@ function unserval(string $data, string $className, int &$offset=0) : object
 				}
 			}
 			else if ($className === 'bool') {
-				$unserialized->{$property->getName()} = unpack('c', $data, $offset)[1];
+				for ($i = 0; $i < $count; ++$i) {
+					$unserialized->{$property->getName()}[] = (bool) (ord($data[$offset + (int) ($i / 8)]) & 128 >> ($i % 8));
+					if ($i > 0 && $i % 8 === 0) {
+						$offset += 1;
+					}
+				}
+				if ($i > 0 && $i % 8 !== 0) {
+					$offset += 1;
+				}
 			}
 			else if ($className === 'float') {
 				if (count($property->getAttributes('ServalSmallFloat')) > 0) {
@@ -329,9 +416,13 @@ function unserval(string $data, string $className, int &$offset=0) : object
 				}
 			}
 		}
+		else if ($typeName === 'bool') {
+			continue;
+		}
 		else if ($typeName === 'int') {
+			list($letter, $bytes) = [null, null];
 			foreach ($property->getAttributes() as $attribute) {
-				list($letter, $bytes) = match ($attribute) {
+				list($letter, $bytes) = match ($attribute->getName()) {
 					'ServalInt8' => ['c', 1],
 					'ServalUInt8' => ['C', 1],
 					'ServalInt16' => ['s', 2],
@@ -340,17 +431,14 @@ function unserval(string $data, string $className, int &$offset=0) : object
 					'ServalUInt32' => ['N', 4],
 					'ServalInt64' => ['q', 8],
 					'ServalUInt64' => ['J', 8],
-					default => [NULL, NULL]
+					default => [null, null]
 				};
-				if ($letter !== NULL) {
+				if ($letter !== null) {
 					break;
 				}
 			}
 			$unserialized->{$property->getName()} = unpack($letter ?? 'q', $data, $offset)[1];
 			$offset += $bytes ?? 8;
-		}
-		else if ($typeName === 'bool') {
-			$unserialized->{$property->getName()} = unpack('c', $data, $offset)[1];
 		}
 		else if ($typeName === 'float') {
 			if (count($property->getAttributes('ServalSmallFloat')) > 0) {
@@ -362,12 +450,11 @@ function unserval(string $data, string $className, int &$offset=0) : object
 				$offset += 8;
 			}
 		}
-		else if ($property->getType() === NULL) {
+		else if ($property->getType() === null) {
 			throw new Exception('A type hint is required for deserialization.');
 		}
 		else {
-			$className = $property->getType();
-			$unserialized->{$property->getName()} = unserval($data, $className, $offset);
+			$unserialized->{$property->getName()} = unserval($data, $typeName, $offset);
 		}
 	}
 	return $unserialized;
